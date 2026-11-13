@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Query
@@ -64,9 +65,12 @@ async def require_password(request: Request, call_next):
     # Basic authentication is shared by all routes, including exports and history.
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         origin = request.headers.get('origin')
-        expected = f'{request.url.scheme}://{request.url.netloc}'
-        if origin and origin != expected:
-            return Response('Cross-origin requests are not allowed', status_code=403)
+        if origin:
+            # Render terminates HTTPS upstream; the ASGI connection may be HTTP.
+            # Compare the public host without trusting forwarded scheme headers.
+            source = urlsplit(origin)
+            if source.scheme not in ('http', 'https') or source.netloc != request.url.netloc or source.path:
+                return Response('Cross-origin requests are not allowed', status_code=403)
     response = await call_next(request)
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Content-Type-Options'] = 'nosniff'

@@ -79,6 +79,7 @@ def test_restart_save_exports_and_partial(configured):
         assert client.post('/api/sessions/missing/save', auth=AUTH).status_code == 404
         assert client.get(path+'/export/zip', auth=AUTH).status_code == 422
         assert client.post(path+'/save', auth=AUTH, headers={'Origin':'https://evil.example'}).status_code == 403
+        assert client.post(path+'/save', auth=AUTH, headers={'Origin':'https://testserver'}).status_code == 200
 
 
 def test_interrupted_and_live_worker(configured):
