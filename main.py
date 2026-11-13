@@ -7,23 +7,44 @@ import traceback
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import FileResponse, Response
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, APIStatusError, RateLimitError, AuthenticationError
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
+from storage import SessionStore
+from exports import pdf_bytes, word_bytes
 
 load_dotenv()
-app = FastAPI(title='THE BOARD', version='1.0')
+@asynccontextmanager
+async def lifespan(app):
+    app.state.store = await asyncio.to_thread(SessionStore, os.getenv('DATABASE_URL'), production=os.getenv('RENDER') == 'true')
+    app.state.tasks = set()
+    yield
+    for task in list(app.state.tasks):
+        task.cancel()
+    await asyncio.gather(*app.state.tasks, return_exceptions=True)
+    await asyncio.to_thread(app.state.store.close)
+
+
+app = FastAPI(title='THE BOARD', version='1.1', lifespan=lifespan)
 ROOT = Path(__file__).parent
-SESSIONS: dict[str, dict] = {}
 MODEL = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('the_board')
+
+
+@app.exception_handler(SQLAlchemyError)
+async def storage_unavailable(request, exc):
+    logger.error('Session storage unavailable (%s)', type(exc).__name__)
+    return Response('Baza de date nu este disponibilă. Reîncearcă salvarea.', status_code=503,
+                    headers={'Cache-Control': 'no-store'})
 
 @app.middleware('http')
 async def require_password(request: Request, call_next):
@@ -35,12 +56,40 @@ async def require_password(request: Request, call_next):
         scheme, encoded = auth.split(' ', 1)
         decoded = base64.b64decode(encoded, validate=True).decode('utf-8')
         username, supplied = decoded.split(':', 1)
-        valid = scheme.lower() == 'basic' and hmac.compare_digest(username, 'board') and hmac.compare_digest(supplied, password)
+        valid = scheme.lower() == 'basic' and hmac.compare_digest(username.encode(), b'board') and hmac.compare_digest(supplied.encode(), password.encode())
     except (ValueError, UnicodeDecodeError):
         valid = False
     if not valid:
         return Response('Authentication required', status_code=401, headers={'WWW-Authenticate': 'Basic realm="THE BOARD"'})
-    return await call_next(request)
+    # Basic authentication is shared by all routes, including exports and history.
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        origin = request.headers.get('origin')
+        expected = f'{request.url.scheme}://{request.url.netloc}'
+        if origin and origin != expected:
+            return Response('Cross-origin requests are not allowed', status_code=403)
+    response = await call_next(request)
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+async def checkpoint(session):
+    # Copy on the event loop, before handing a snapshot to the DB thread.
+    snapshot = json.loads(json.dumps(session))
+    await asyncio.to_thread(app.state.store.checkpoint, snapshot)
+
+
+async def heartbeat(sid):
+    while True:
+        await asyncio.sleep(15)
+        await asyncio.to_thread(app.state.store.touch, sid)
+
+
+async def load_session(sid):
+    session = await asyncio.to_thread(app.state.store.get, sid)
+    if session is None:
+        raise HTTPException(404, 'Sesiune inexistentă.')
+    return session
 
 
 ROLES = [
@@ -104,7 +153,9 @@ async def ask_vote(client, role, specialty, focus, task):
     return Vote.model_validate(json.loads(raw)).model_dump()
 
 async def run_board(sid: str):
-    s = SESSIONS[sid]
+    s = await load_session(sid)
+    pulse = asyncio.create_task(heartbeat(sid))
+    client = None
     try:
         client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'), timeout=40.0, max_retries=1)
         idea = s['idea']
@@ -112,39 +163,70 @@ async def run_board(sid: str):
         async def bounded(fn, *args):
             async with semaphore:
                 return await fn(client, *args)
+        async def collect(tasks, target, *, votes=False):
+            """Persist each completed member, including partial rounds on interruption."""
+            completed = {}
+            lock = asyncio.Lock()
+            async def member(i, work):
+                result = await work
+                async with lock:
+                    completed[i] = result
+                    target[:] = [({'agent': ROLES[j][0], **completed[j]} if votes else
+                                  {'agent': ROLES[j][0], 'text': completed[j]}) for j in sorted(completed)]
+                    await checkpoint(s)
+                return result
+            pending = [asyncio.create_task(member(i, work)) for i, work in enumerate(tasks)]
+            try:
+                return await asyncio.gather(*pending)
+            finally:
+                for work in pending:
+                    if not work.done():
+                        work.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         logger.info('Session %s: starting independent analysis, model=%s', sid, MODEL)
         s['phase'] = 'Analiză independentă'
+        await checkpoint(s)
         tasks = [bounded(ask, name, spec, focus,
             f'IDEA: {idea_text(idea)}\nProvide an independent assessment (150-220 words): strongest opportunity, biggest flaw, short-term (0-12 months), long-term (1-5 years), one key question and one test. Do not assume other agents agree.') for name,spec,focus in ROLES]
-        first = await asyncio.gather(*tasks)
+        first = await collect(tasks, s['analyses'])
         s['analyses'] = [{'agent':r[0], 'text':t} for r,t in zip(ROLES,first)]
         logger.info('Session %s: independent analysis complete', sid)
         s['phase'] = 'Dezbatere'
+        await checkpoint(s)
         previous = first
         for round_number in range(1, idea['rounds'] + 1):
             # Shared summaries ensure every agent sees counterarguments, while keeping requests bounded.
             discussion = '\n'.join(f'{ROLES[i][0]}: {t[:650]}' for i,t in enumerate(previous))
             tasks = [bounded(ask, name, spec, focus,
                 f'IDEA: {idea_text(idea)}\nROUND {round_number}. Other committee positions:\n{discussion}\nChallenge at least one named colleague with a concrete reason, acknowledge a valid objection, propose a measurable mitigation, and state what would change your mind. 100-160 words.', 500) for name,spec,focus in ROLES]
-            previous = await asyncio.gather(*tasks)
-            s['debates'].append({'round':round_number, 'messages':[{'agent':r[0], 'text':t} for r,t in zip(ROLES,previous)]})
+            current_round = {'round':round_number, 'messages':[]}
+            s['debates'].append(current_round)
+            previous = await collect(tasks, current_round['messages'])
+            await checkpoint(s)
         logger.info('Session %s: debate complete', sid)
         s['phase'] = 'Vot final'
+        await checkpoint(s)
         debate = '\n'.join(f'{ROLES[i][0]}: {t[:550]}' for i,t in enumerate(previous))
         tasks = [bounded(ask_vote, name, spec, focus,
             f'IDEA: {idea_text(idea)}\nFinal debate:\n{debate}\nVote independently YES, NO, or CONDITIONAL. Explain with short-term and long-term tradeoffs, cite conditions required for investment. Confidence means confidence in your assessment, NOT probability of business success.') for name,spec,focus in ROLES]
-        votes = await asyncio.gather(*tasks)
+        votes = await collect(tasks, s['votes'], votes=True)
         s['votes'] = [{'agent':r[0], **v} for r,v in zip(ROLES,votes)]
         tally = {v:sum(x['vote']==v for x in votes) for v in ['YES','NO','CONDITIONAL']}
         s['tally'] = tally
         logger.info('Session %s: votes complete', sid)
         s['phase'] = 'Raport strategic'
+        await checkpoint(s)
         summary = await bounded(ask, 'CEO', 'Chair and synthesis author', 'Transparent synthesis',
             f'IDEA: {idea_text(idea)}\nTALLY: {tally}\nVOTES: {json.dumps(s["votes"],ensure_ascii=False)}\nLATEST DEBATE: {debate}\nWrite a detailed structured Romanian executive report with sections: verdict (explicitly acknowledge vote counts and disagreement), 0-3 months, 3-12 months, 1-3 years, 3-5 years, unit economics and break-even formulas with inputs marked unknown, optimistic/base/pessimistic scenarios with illustrative assumptions only, top 5 risks, 30-day validation plan, kill criteria, what information is missing. Do not invent numerical certainty.', 2200)
         s['report'] = summary
         s['phase'] = 'Finalizat'
         s['status'] = 'completed'
         logger.info('Session %s: completed', sid)
+        await checkpoint(s)
+    except asyncio.CancelledError:
+        s.update(status='interrupted', phase='Întrerupt', error='Serverul s-a oprit. Rezultatele salvate rămân disponibile.')
+        await checkpoint(s)
+        raise
     except Exception as e:
         # Logs show the root cause, including chained network/DNS/TLS exceptions.
         # Never log request headers, API keys, or the user's business idea.
@@ -162,7 +244,17 @@ async def run_board(sid: str):
         elif isinstance(e, APIStatusError):
             s['error'] = f'OpenAI a returnat HTTP {e.status_code}. Verifică modelul, permisiunile și logurile Render.'
         else:
-            s['error'] = f'{type(e).__name__}: {str(e)[:250]}'
+            s['error'] = 'Procesarea a eșuat. Rezultatele salvate rămân disponibile. Verifică logurile serverului.'
+        await checkpoint(s)
+    finally:
+        pulse.cancel()
+        with suppress(asyncio.CancelledError):
+            try:
+                await pulse
+            except Exception as exc:
+                logger.error('Session heartbeat stopped (%s)', type(exc).__name__)
+        if client is not None:
+            await client.close()
 
 
 @app.get('/')
@@ -174,17 +266,46 @@ async def create_session(idea: Idea):
     if not os.getenv('OPENAI_API_KEY'):
         raise HTTPException(503, 'OPENAI_API_KEY lipsește. Configurează variabila în Render → Environment.')
     sid = str(uuid.uuid4())
-    SESSIONS[sid] = {'id':sid, 'idea':idea.model_dump(), 'status':'running', 'phase':'Pornire', 'analyses':[], 'debates':[], 'votes':[], 'tally':{}, 'report':'', 'error':None, 'created_at':datetime.now(timezone.utc).isoformat()}
-    asyncio.create_task(run_board(sid))
+    session = {'id':sid, 'idea':idea.model_dump(), 'status':'running', 'phase':'Pornire', 'analyses':[], 'debates':[], 'votes':[], 'tally':{}, 'report':'', 'error':None, 'created_at':datetime.now(timezone.utc).isoformat()}
+    await asyncio.to_thread(app.state.store.create, session)
+    task = asyncio.create_task(run_board(sid))
+    app.state.tasks.add(task)
+    task.add_done_callback(app.state.tasks.discard)
     return {'id':sid}
 
 @app.get('/api/sessions/{sid}')
 async def get_session(sid: str):
-    if sid not in SESSIONS:
-        raise HTTPException(404, 'Sesiune inexistentă sau server repornit.')
-    return SESSIONS[sid]
+    return await load_session(sid)
+
+
+@app.get('/api/sessions')
+async def list_sessions(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    return await asyncio.to_thread(app.state.store.list, limit, offset)
+
+
+@app.post('/api/sessions/{sid}/save')
+async def save_session(sid: str):
+    stamp = await asyncio.to_thread(app.state.store.save, sid)
+    if stamp is None:
+        raise HTTPException(404, 'Sesiune inexistentă.')
+    return {'id': sid, 'saved_at': stamp, 'persistent': True}
+
+
+@app.get('/api/sessions/{sid}/export/{format}')
+async def export_session(sid: str, format: Literal['pdf', 'docx', 'json']):
+    session = await load_session(sid)
+    if format == 'json':
+        data = json.dumps(session, ensure_ascii=False, indent=2).encode('utf-8')
+        media = 'application/json'
+    else:
+        data = await asyncio.to_thread(pdf_bytes if format == 'pdf' else word_bytes, session)
+        media = 'application/pdf' if format == 'pdf' else 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    # Never interpolate a user-controlled title or raw path into the header.
+    safe_id = str(uuid.UUID(session['id']))
+    return Response(data, media_type=media, headers={'Content-Disposition': f'attachment; filename="the-board-{safe_id}.{format}"'})
 
 @app.get('/health')
 async def health():
-    return {'ok':True, 'api_key_configured':bool(os.getenv('OPENAI_API_KEY')), 'model':MODEL}
+    await asyncio.to_thread(app.state.store.list, 1, 0)
+    return {'ok':True, 'storage':'postgresql' if app.state.store.engine.dialect.name == 'postgresql' else 'sqlite-development', 'api_key_configured':bool(os.getenv('OPENAI_API_KEY')), 'model':MODEL, 'version':'1.1'}
 
