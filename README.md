@@ -55,6 +55,19 @@ uvicorn main:app --host 127.0.0.1 --port 8000
 
 ## Persistență în producție (serviciul existent)
 
+### Varianta fără card: Neon Free
+
+Aplicația poate rămâne pe Render Free și poate folosi PostgreSQL de la Neon Free. Nu este necesar un card pe Render. Planul Neon Free nu cere card și nu are termen fix de expirare; se aplică limitele sale de stocare, calcul și trafic. Verifică limitele actuale la https://neon.com/pricing.
+
+1. Creează/autorizează un cont Neon și un proiect pe planul **Free**, numit `the-board-sessions`. Alege o regiune apropiată de Oregon dacă este disponibilă.
+2. Folosește connection string PostgreSQL al proiectului, cu TLS activ (`sslmode=require` sau modul mai strict oferit de furnizor). Setează-l ca **DATABASE_URL** în Environment al serviciului Render existent. Nu publica valoarea în GitHub sau în chat.
+3. Nu activa AI Gateway sau alte servicii plătite Neon; aplicația folosește doar PostgreSQL și cheia OpenAI deja configurată pe Render.
+4. Publică versiunea nouă numai după configurarea conexiunii, apoi verifică `/health` cu autentificare, salvarea, exporturile și istoricul după redeploy.
+
+Compute-ul Neon poate adormi când nu există activitate și se reactivează la conectare; datele rămân în stocarea bazei. La depășirea limitelor planului gratuit poate fi necesară așteptarea resetării limitei sau schimbarea planului. Exporturile PDF/Word/JSON rămân utile drept copii independente.
+
+### Alternativa Render Postgres (cu plată)
+
 Înainte de publicarea versiunii 1.1:
 
 1. Configurează o instanță PostgreSQL persistentă. Pentru Render folosește același workspace și aceeași regiune ca aplicația: **The board / Oregon**, după confirmarea proprietarului. Verifică planul, costurile și retenția; baza Render Free expiră și nu este potrivită pentru păstrare pe termen lung.
