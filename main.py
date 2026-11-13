@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import FileResponse, Response
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, APIStatusError, RateLimitError, AuthenticationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from storage import SessionStore
 from exports import pdf_bytes, word_bytes
@@ -34,7 +34,7 @@ async def lifespan(app):
     await asyncio.to_thread(app.state.store.close)
 
 
-app = FastAPI(title='THE BOARD', version='1.1', lifespan=lifespan)
+app = FastAPI(title='THE BOARD', version='1.2', lifespan=lifespan)
 ROOT = Path(__file__).parent
 MODEL = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
 logging.basicConfig(level=logging.INFO)
@@ -120,9 +120,10 @@ class Idea(BaseModel):
     rounds: int = Field(default=2, ge=1, le=3)
 
 class Vote(BaseModel):
+    model_config = ConfigDict(strict=True, extra='forbid')
     vote: Literal['YES', 'NO', 'CONDITIONAL']
     confidence: int = Field(ge=0, le=100)
-    reasoning: str
+    reasoning: str = Field(min_length=1)
     conditions: list[str]
 
 SYSTEM = '''You are one distinct member of a 12-person business investment committee. Stay faithful to your assigned expertise. Respond in Romanian. Be incisive, specific, and willing to disagree. Never invent market facts, research, regulations, pricing, or sources. If not supplied or verified, mark numbers as illustrative assumptions. Distinguish facts, assumptions, and unknowns. Provide practical and falsifiable next steps. No false consensus. Do not claim to have browsed or performed independent research. You are an AI simulation of an expert role, not a licensed professional.'''
@@ -142,19 +143,49 @@ async def ask(client, role, specialty, focus, task, max_tokens=650):
     )
     return (response.choices[0].message.content or '').strip()
 
+class VoteUnavailable(Exception):
+    """Expected member failure, safe to persist without provider response text."""
+    def __init__(self, reason, attempts):
+        self.reason = reason
+        self.attempts = attempts
+        super().__init__(reason)
+
+
 async def ask_vote(client, role, specialty, focus, task):
-    response = await client.chat.completions.create(
+    # Fresh generations, never repair or count a partial JSON document as a vote.
+    for attempt, budget in enumerate((1000, 2000, 3000), 1):
+        response = await client.chat.completions.create(
         model=MODEL,
         messages=[
-            {'role':'system','content': SYSTEM + f'\nRole: {role} ({specialty}). Focus: {focus}. Return only valid JSON with keys vote (YES/NO/CONDITIONAL), confidence (integer 0-100), reasoning (string), conditions (array of strings).'},
-            {'role':'user','content':task},
+            {'role':'system','content': SYSTEM + f'\nRole: {role} ({specialty}). Focus: {focus}. Return JSON matching the supplied schema. Keep reasoning under 120 Romanian words and at most 4 concise conditions.'},
+            {'role':'user','content':task + ('\nThe previous generation was incomplete or invalid. Produce a fresh, concise, complete JSON vote.' if attempt > 1 else '')},
         ],
-        response_format={'type':'json_object'},
+        response_format={'type':'json_schema', 'json_schema': {
+            'name':'board_vote', 'strict':True, 'schema':Vote.model_json_schema()}},
         temperature=0.25,
-        max_tokens=400,
-    )
-    raw = response.choices[0].message.content or '{}'
-    return Vote.model_validate(json.loads(raw)).model_dump()
+        max_tokens=budget,
+        )
+        choice = response.choices[0] if response.choices else None
+        finish = choice.finish_reason if choice else None
+        usage = getattr(response, 'usage', None)
+        logger.info('Vote role=%s attempt=%s model=%s max_tokens=%s finish_reason=%s completion_tokens=%s',
+                    role, attempt, response.model, budget, finish, getattr(usage, 'completion_tokens', None))
+        if choice and getattr(choice.message, 'refusal', None):
+            raise VoteUnavailable('refusal', attempt)
+        if finish == 'content_filter':
+            raise VoteUnavailable('content_filter', attempt)
+        reason = 'incomplete_response'
+        if choice and finish == 'stop':
+            try:
+                return Vote.model_validate_json(choice.message.content or '').model_dump()
+            except ValidationError:
+                reason = 'invalid_json_or_schema'
+        elif finish == 'length':
+            reason = 'token_limit'
+        logger.warning('Vote rejected role=%s attempt=%s reason=%s', role, attempt, reason)
+        if attempt < 3:
+            await asyncio.sleep(0.5 * attempt)
+    raise VoteUnavailable(reason, attempt)
 
 async def run_board(sid: str):
     s = await load_session(sid)
@@ -170,13 +201,27 @@ async def run_board(sid: str):
         async def collect(tasks, target, *, votes=False):
             """Persist each completed member, including partial rounds on interruption."""
             completed = {}
+            failures = {}
             lock = asyncio.Lock()
             async def member(i, work):
-                result = await work
+                try:
+                    result = await work
+                except (VoteUnavailable, APIConnectionError, APIStatusError) as exc:
+                    if not votes:
+                        raise
+                    result = None
+                    failures[i] = {'agent': ROLES[i][0],
+                        'reason': exc.reason if isinstance(exc, VoteUnavailable) else type(exc).__name__,
+                        'attempts': exc.attempts if isinstance(exc, VoteUnavailable) else None}
+                    logger.warning('Session %s vote unavailable role=%s reason=%s', sid, ROLES[i][0], failures[i]['reason'])
                 async with lock:
-                    completed[i] = result
+                    if result is not None:
+                        completed[i] = result
                     target[:] = [({'agent': ROLES[j][0], **completed[j]} if votes else
                                   {'agent': ROLES[j][0], 'text': completed[j]}) for j in sorted(completed)]
+                    if votes:
+                        s['vote_errors'] = [failures[j] for j in sorted(failures)]
+                        s['tally'] = {v:sum(x['vote'] == v for x in target) for v in ['YES','NO','CONDITIONAL']}
                     await checkpoint(s)
                 return result
             pending = [asyncio.create_task(member(i, work)) for i, work in enumerate(tasks)]
@@ -214,16 +259,16 @@ async def run_board(sid: str):
         tasks = [bounded(ask_vote, name, spec, focus,
             f'IDEA: {idea_text(idea)}\nFinal debate:\n{debate}\nVote independently YES, NO, or CONDITIONAL. Explain with short-term and long-term tradeoffs, cite conditions required for investment. Confidence means confidence in your assessment, NOT probability of business success.') for name,spec,focus in ROLES]
         votes = await collect(tasks, s['votes'], votes=True)
-        s['votes'] = [{'agent':r[0], **v} for r,v in zip(ROLES,votes)]
+        votes = [v for v in votes if v is not None]
         tally = {v:sum(x['vote']==v for x in votes) for v in ['YES','NO','CONDITIONAL']}
         s['tally'] = tally
         logger.info('Session %s: votes complete', sid)
         s['phase'] = 'Raport strategic'
         await checkpoint(s)
         summary = await bounded(ask, 'CEO', 'Chair and synthesis author', 'Transparent synthesis',
-            f'IDEA: {idea_text(idea)}\nTALLY: {tally}\nVOTES: {json.dumps(s["votes"],ensure_ascii=False)}\nLATEST DEBATE: {debate}\nWrite a detailed structured Romanian executive report with sections: verdict (explicitly acknowledge vote counts and disagreement), 0-3 months, 3-12 months, 1-3 years, 3-5 years, unit economics and break-even formulas with inputs marked unknown, optimistic/base/pessimistic scenarios with illustrative assumptions only, top 5 risks, 30-day validation plan, kill criteria, what information is missing. Do not invent numerical certainty.', 2200)
+            f'IDEA: {idea_text(idea)}\nTALLY: {tally}\nVOTES: {json.dumps(s["votes"],ensure_ascii=False)}\nUNAVAILABLE VOTES: {json.dumps(s.get("vote_errors", []))}. Only {len(votes)} of {len(ROLES)} votes are valid. Missing votes are NOT NO or abstentions. Explicitly disclose incomplete voting; if none are valid, give no committee verdict.\nLATEST DEBATE: {debate}\nWrite a detailed structured Romanian executive report with sections: verdict (explicitly acknowledge vote counts and disagreement), 0-3 months, 3-12 months, 1-3 years, 3-5 years, unit economics and break-even formulas with inputs marked unknown, optimistic/base/pessimistic scenarios with illustrative assumptions only, top 5 risks, 30-day validation plan, kill criteria, what information is missing. Do not invent numerical certainty.', 2200)
         s['report'] = summary
-        s['phase'] = 'Finalizat'
+        s['phase'] = 'Finalizat cu voturi indisponibile' if s.get('vote_errors') else 'Finalizat'
         s['status'] = 'completed'
         logger.info('Session %s: completed', sid)
         await checkpoint(s)
@@ -311,5 +356,5 @@ async def export_session(sid: str, format: Literal['pdf', 'docx', 'json']):
 @app.get('/health')
 async def health():
     await asyncio.to_thread(app.state.store.list, 1, 0)
-    return {'ok':True, 'storage':'postgresql' if app.state.store.engine.dialect.name == 'postgresql' else 'sqlite-development', 'api_key_configured':bool(os.getenv('OPENAI_API_KEY')), 'model':MODEL, 'version':'1.1'}
+    return {'ok':True, 'storage':'postgresql' if app.state.store.engine.dialect.name == 'postgresql' else 'sqlite-development', 'api_key_configured':bool(os.getenv('OPENAI_API_KEY')), 'model':MODEL, 'version':'1.2'}
 

@@ -18,6 +18,8 @@ def sections(session):
         for item in debate['messages']:
             yield f"Dezbatere {debate['round']} — {item['agent']}", item['text']
     yield 'Rezultatul votului', '\n'.join(f'{k}: {v}' for k, v in session['tally'].items()) or 'Votul nu este încă disponibil.'
+    if session.get('vote_errors'):
+        yield 'Voturi indisponibile', 'Nu sunt incluse în total: ' + ', '.join(v['agent'] for v in session['vote_errors'])
     for vote in session['votes']:
         yield f"Vot — {vote['agent']}", f"{vote['vote']} · Încredere: {vote['confidence']}%\n{vote['reasoning']}\nCondiții: " + '; '.join(vote['conditions'])
     yield 'Limitări', 'Simulare AI cu 12 perspective, nu experți umani independenți. Ipotezele și datele neverificate necesită validare.'
